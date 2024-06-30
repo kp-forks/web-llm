@@ -10,7 +10,7 @@
 **High-Performance In-Browser LLM Inference Engine.**
 
 
-[Get Started](#get-started) | [Examples](examples) | [Documentation](https://mlc.ai/mlc-llm/docs/deploy/javascript.html)
+[Get Started](#get-started) | [Examples](examples) | [Documentation](https://mlc.ai/mlc-llm/docs/deploy/webllm.html)
 
 </div>
 
@@ -20,12 +20,11 @@ Everything runs inside the browser with no server support and is accelerated wit
 
 WebLLM is **fully compatible with [OpenAI API](https://platform.openai.com/docs/api-reference/chat).**
 That is, you can use the same OpenAI API on **any open source models** locally, with functionalities
-including JSON-mode, function-calling, streaming, etc.
+including streaming, JSON-mode, function-calling (WIP), etc.
 
 We can bring a lot of fun opportunities to build AI assistants for everyone and enable privacy while enjoying GPU acceleration.
 
-You can use WebLLM as a base [npm package](https://www.npmjs.com/package/@mlc-ai/web-llm) and build your own web application on top of it by following the [documentation](https://mlc.ai/mlc-llm/docs/deploy/javascript.html) and checking out [Get Started](#get-started).
-This project is a companion project of [MLC LLM](https://github.com/mlc-ai/mlc-llm), which enables universal deployment of LLM across hardware environments.
+You can use WebLLM as a base [npm package](https://www.npmjs.com/package/@mlc-ai/web-llm) and build your own web application on top of it by following the examples below. This project is a companion project of [MLC LLM](https://github.com/mlc-ai/mlc-llm), which enables universal deployment of LLM across hardware environments.
 
 <div align="center">
 
@@ -36,9 +35,11 @@ This project is a companion project of [MLC LLM](https://github.com/mlc-ai/mlc-l
 ## Key Features
 - **In-Browser Inference**: WebLLM is a high-performance, in-browser language model inference engine that leverages WebGPU for hardware acceleration, enabling powerful LLM operations directly within web browsers without server-side processing.
 
-- [**Full OpenAI API Compatibility**](#full-openai-compatibility): Seamlessly integrate your app with WebLLM using OpenAI API with functionalities such as JSON-mode, function-calling, streaming, and more.
+- [**Full OpenAI API Compatibility**](#full-openai-compatibility): Seamlessly integrate your app with WebLLM using OpenAI API with functionalities such as streaming, JSON-mode, logit-level control, seeding, and more.
 
-- [**Extensive Model Support**](#built-in-models): WebLLM natively supports a range of models including Llama 3, Phi 3, Gemma, Mistral, Qwen(通义千问), and many others, making it versatile for various AI tasks.
+- **Structured JSON Generation**: WebLLM supports state-of-the-art JSON mode structured generation, implemented in the WebAssembly portion of the model library for optimal performance. Check [WebLLM JSON Playground](https://huggingface.co/spaces/mlc-ai/WebLLM-JSON-Playground) on HuggingFace to try generating JSON output with custom JSON schema.
+
+- [**Extensive Model Support**](#built-in-models): WebLLM natively supports a range of models including Llama 3, Phi 3, Gemma, Mistral, Qwen(通义千问), and many others, making it versatile for various AI tasks. For the complete supported model list, check [MLC Models](https://mlc.ai/models).
 
 - [**Custom Model Integration**](#custom-models): Easily integrate and deploy custom models in MLC format, allowing you to adapt WebLLM to specific needs and scenarios, enhancing flexibility in model deployment.
 
@@ -52,17 +53,15 @@ This project is a companion project of [MLC LLM](https://github.com/mlc-ai/mlc-l
 
 ## Built-in Models
 
-The following models are natively supported in WebLLM and their detailed configuration can be accessed from [`prebuiltAppConfig.model_list`](https://github.com/mlc-ai/web-llm/blob/main/src/config.ts#L293).
+Check the complete list of available models on [MLC Models](https://mlc.ai/models). WebLLM supports a subset of these available models and the list can be accessed at [`prebuiltAppConfig.model_list`](https://github.com/mlc-ai/web-llm/blob/main/src/config.ts#L293).
 
-- Llama 3
-- Phi 3
-- Mistral
-- Gemma
-- Qwen (通义千问)
-- Hermes (finetuned variants of Llama 3 and Mistral)
-- RedPajama
-- Zephyr
-- TinyLlama
+Here are the primary families of models currently supported:
+
+- **Llama**: Llama 3, Llama 2, Hermes-2-Pro-Llama-3
+- **Phi**: Phi 3, Phi 2, Phi 1.5
+- **Gemma**: Gemma-2B
+- **Mistral**: Mistral-7B-v0.3, Hermes-2-Pro-Mistral-7B, NeuralHermes-2.5-Mistral-7B, OpenHermes-2.5-Mistral-7B
+- **Qwen (通义千问)**: Qwen2 0.5B, 1.5B, 7B
 
 If you need more models, [request a new model via opening an issue](https://github.com/mlc-ai/web-llm/issues/new/choose) or check [Custom Models](#custom-models) for how to compile and use your own models with WebLLM.
 
@@ -116,7 +115,7 @@ import * as webllm from "https://esm.run/@mlc-ai/web-llm";
 
 Most operations in WebLLM are invoked through the `MLCEngine` interface. You can create an `MLCEngine` instance and loading the model by calling the `CreateMLCEngine()` factory function.
 
-(Note that loading models requires downloading and it can take a significant amount of time for the very first run without previous cache. You should properly handle this asynchronous call.)
+(Note that loading models requires downloading and it can take a significant amount of time for the very first run without caching previously. You should properly handle this asynchronous call.)
 
 ```typescript
 import { CreateMLCEngine } from "@mlc-ai/web-llm";
@@ -129,7 +128,7 @@ const selectedModel = "Llama-3-8B-Instruct-q4f32_1-MLC";
 
 const engine = await CreateMLCEngine(
   selectedModel,
-  { initProgressCallback }, // engineConfig
+  { initProgressCallback: initProgressCallback }, // engineConfig
 );
 ```
 
@@ -139,8 +138,9 @@ Under the hood, this factory function does the following steps for first creatin
 import { MLCEngine } from "@mlc-ai/web-llm";
 
 // This is a synchrounous call that returns immediately
-const engine = new MLCEngine();
-engine.setInitProgressCallback(initProgressCallback);
+const engine = new MLCEngine({
+  initProgressCallback: initProgressCallback
+});
 
 // This is an asynchrounous call and can take a long time to finish
 await engine.reload(selectedModel);
@@ -198,28 +198,35 @@ console.log(fullReply);
 
 ## Advanced Usage
 
-### Using Web Worker
+### Using Workers
+
+You can put the heavy computation in a worker script to optimize your application performance. To do so, you need to:
+
+1. Create a handler in the worker thread that communicates with the frontend while handling the requests.
+2. Create a Worker Engine in your main application, which under the hood sends messages to the handler in the worker thread.
+
+For detailed implementation for different kinds of Workers, check the following sections.
+
+#### Dedicated Web Worker
 
 WebLLM comes with API support for WebWorker so you can hook
 the generation process into a separate worker thread so that
 the computing in the worker thread won't disrupt the UI.
 
-We will first create a worker script with a MLCEngine and
-hook it up to a handler that handles requests.
+We create a handler in the worker thread that communicates with the frontend while handling the requests.
 
 ```typescript
 // worker.ts
-import { MLCEngineWorkerHandler, MLCEngine } from "@mlc-ai/web-llm";
+import { WebWorkerMLCEngineHandler } from "@mlc-ai/web-llm";
 
-// Hookup an MLCEngine to a worker handler
-const engine = new MLCEngine();
-const handler = new MLCEngineWorkerHandler(engine);
+// A handler that resides in the worker thread
+const handler = new WebWorkerMLCEngineHandler();
 self.onmessage = (msg: MessageEvent) => {
   handler.onmessage(msg);
 };
 ```
 
-Then in the main logic, we create a `WebWorkerMLCEngine` that
+In the main logic, we create a `WebWorkerMLCEngine` that
 implements the same `MLCEngineInterface`. The rest of the logic remains the same.
 
 ```typescript
@@ -251,27 +258,22 @@ your application's offline experience.
 
 (Note, Service Worker's life cycle is managed by the browser and can be killed any time without notifying the webapp. `ServiceWorkerMLCEngine` will try to keep the service worker thread alive by periodically sending heartbeat events, but your application should also include proper error handling. Check `keepAliveMs` and `missedHeatbeat` in [`ServiceWorkerMLCEngine`](https://github.com/mlc-ai/web-llm/blob/main/src/service_worker.ts#L234) for more details.)
 
-We first create a service worker script with a MLCEngine and hook it up to a handler
-that handles requests when the service worker is ready.
+We create a handler in the worker thread that communicates with the frontend while handling the requests.
 
 
 ```typescript
 // sw.ts
-import {
-  ServiceWorkerMLCEngineHandler,
-  MLCEngine,
-} from "@mlc-ai/web-llm";
+import { ServiceWorkerMLCEngineHandler } from "@mlc-ai/web-llm";
 
-const engine = new MLCEngine();
 let handler: ServiceWorkerMLCEngineHandler;
 
 self.addEventListener("activate", function (event) {
-  handler = new ServiceWorkerMLCEngineHandler(engine);
+  handler = new ServiceWorkerMLCEngineHandler();
   console.log("Service Worker is ready");
 });
 ```
 
-Then in the main logic, we register the service worker and then create the engine using
+Then in the main logic, we register the service worker and create the engine using
 `CreateServiceWorkerMLCEngine` function. The rest of the logic remains the same.
 
 ```typescript
@@ -302,14 +304,14 @@ WebLLM is designed to be fully compatible with [OpenAI API](https://platform.ope
 
 - [streaming](examples/streaming): return output as chunks in real-time in the form of an AsyncGenerator
 - [json-mode](examples/json-mode): efficiently ensure output is in JSON format, see [OpenAI Reference](https://platform.openai.com/docs/guides/text-generation/chat-completions-api) for more.
-- [function-calling](examples/function-calling): function calling with fields `tools` and `tool_choice`.
 - [seed-to-reproduce](examples/seed-to-reproduce): use seeding to ensure a reproducible output with fields `seed`.
+- [function-calling](examples/function-calling) (WIP): function calling with fields `tools` and `tool_choice` (with preliminary support).
 
 ## Custom Models
 
 WebLLM works as a companion project of [MLC LLM](https://github.com/mlc-ai/mlc-llm) and it supports custom models in MLC format. 
 It reuses the model artifact and builds the flow of MLC LLM. To compile and use your own models with WebLLM, please check out
-[MLC LLM document](https://llm.mlc.ai/docs/deploy/javascript.html)
+[MLC LLM document](https://llm.mlc.ai/docs/deploy/webllm.html)
 on how to compile and deploy new model weights and libraries to WebLLM. 
 
 Here, we go over the high-level idea. There are two elements of the WebLLM package that enable new models and weight variants.
@@ -345,7 +347,8 @@ async main() {
   // assuming that it is compatible to the model in myLlamaUrl.
   const engine = await CreateMLCEngine(
     "MyLlama-3b-v1-q4f32_0",
-    { chatOpts, appConfig } // engineConfig
+    { appConfig }, // engineConfig
+    chatOpts,
   );
 }
 ```
@@ -353,7 +356,7 @@ async main() {
 In many cases, we only want to supply the model weight variant, but
 not necessarily a new model (e.g. `NeuralHermes-Mistral` can reuse `Mistral`'s
 model library). For examples of how a model library can be shared by different model variants,
-see `prebuiltAppConfig`.
+see `webllm.prebuiltAppConfig`.
 
 ## Build WebLLM Package From Source
 

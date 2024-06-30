@@ -10,6 +10,7 @@ import {
   InitProgressCallback,
   InitProgressReport,
   LogLevel,
+  LogitProcessor,
 } from "./types";
 import {
   ChatCompletionRequest,
@@ -33,10 +34,11 @@ import {
   WorkerRequest,
 } from "./message";
 import log from "loglevel";
-
-export interface PostMessageHandler {
-  postMessage: (message: any) => void;
-}
+import { MLCEngine } from "./engine";
+import {
+  UnknownMessageKindError,
+  WorkerEngineModelNotLoadedError,
+} from "./error";
 
 /**
  * Worker handler that can be used in a WebWorker
@@ -46,53 +48,41 @@ export interface PostMessageHandler {
  * // setup a chat worker handler that routes
  * // requests to the chat
  * const engine = new MLCEngine();
- * cont handler = new MLCEngineWorkerHandler(engine);
+ * cont handler = new WebWorkerMLCEngineHandler(engine);
  * onmessage = handler.onmessage;
  */
-export class MLCEngineWorkerHandler {
-  protected engine: MLCEngineInterface;
+export class WebWorkerMLCEngineHandler {
+  public engine: MLCEngine;
   protected chatCompletionAsyncChunkGenerator?: AsyncGenerator<
     ChatCompletionChunk,
     void,
     void
   >;
-  protected postMessageHandler?: PostMessageHandler;
 
   /**
    * @param engine A concrete implementation of MLCEngineInterface
-   * @param postMessageHandler Optionally, a handler to communicate with the content script.
-   *   This is only needed in ServiceWorker. In web worker, we can use `postMessage` from
-   *   DOM API directly.
    */
-  constructor(
-    engine: MLCEngineInterface,
-    postMessageHandler?: PostMessageHandler,
-    initProgressCallback?: (report: InitProgressReport) => void,
-  ) {
-    this.engine = engine;
-    this.postMessageHandler = postMessageHandler;
-    const defaultInitProgressCallback = (report: InitProgressReport) => {
+  constructor() {
+    this.engine = new MLCEngine();
+    this.engine.setInitProgressCallback((report: InitProgressReport) => {
       const msg: WorkerResponse = {
         kind: "initProgressCallback",
         uuid: "",
         content: report,
       };
-      this.postMessageInternal(msg);
-    };
-    this.engine.setInitProgressCallback(
-      initProgressCallback || defaultInitProgressCallback,
-    );
+      this.postMessage(msg);
+    });
   }
 
-  postMessageInternal(event: any) {
-    // Use the Worker API postMessage by default
-    this.postMessageHandler
-      ? this.postMessageHandler.postMessage(event)
-      : postMessage(event);
+  postMessage(msg: any) {
+    // Use Web Worker DOM Message API
+    postMessage(msg);
   }
 
-  setPostMessageHandler(postMessageHandler: PostMessageHandler) {
-    this.postMessageHandler = postMessageHandler;
+  setLogitProcessorRegistry(
+    logitProcessorRegistry?: Map<string, LogitProcessor>,
+  ) {
+    this.engine.setLogitProcessorRegistry(logitProcessorRegistry);
   }
 
   async handleTask<T extends MessageContent>(
@@ -106,7 +96,7 @@ export class MLCEngineWorkerHandler {
         uuid: uuid,
         content: res,
       };
-      this.postMessageInternal(msg);
+      this.postMessage(msg);
     } catch (err) {
       const errStr = (err as object).toString();
       const msg: WorkerResponse = {
@@ -114,7 +104,7 @@ export class MLCEngineWorkerHandler {
         uuid: uuid,
         content: errStr,
       };
-      this.postMessageInternal(msg);
+      this.postMessage(msg);
     }
   }
 
@@ -133,11 +123,7 @@ export class MLCEngineWorkerHandler {
       case "reload": {
         this.handleTask(msg.uuid, async () => {
           const params = msg.content as ReloadParams;
-          await this.engine.reload(
-            params.modelId,
-            params.chatOpts,
-            params.appConfig,
-          );
+          await this.engine.reload(params.modelId, params.chatOpts);
           onComplete?.(null);
           return null;
         });
@@ -155,7 +141,7 @@ export class MLCEngineWorkerHandler {
                 currentMessage: currentMessage,
               },
             };
-            this.postMessageInternal(cbMessage);
+            this.postMessage(cbMessage);
           };
           const res = await this.engine.generate(
             params.input,
@@ -282,6 +268,12 @@ export class MLCEngineWorkerHandler {
         onComplete?.(null);
         return;
       }
+      case "setAppConfig": {
+        const appConfig = msg.content as AppConfig;
+        this.engine.setAppConfig(appConfig);
+        onComplete?.(null);
+        return;
+      }
       case "customRequest": {
         onComplete?.(null);
         return;
@@ -289,9 +281,7 @@ export class MLCEngineWorkerHandler {
       default: {
         if (msg.kind && msg.content) {
           onError?.();
-          throw Error(
-            "Unknown message kind, msg: [" + msg.kind + "] " + msg.content,
-          );
+          throw new UnknownMessageKindError(msg.kind, msg.content);
         } else {
           // Ignore irrelavent events
           onComplete?.(null);
@@ -323,16 +313,10 @@ export async function CreateWebWorkerMLCEngine(
   worker: any,
   modelId: string,
   engineConfig?: MLCEngineConfig,
+  chatOpts?: ChatOptions,
 ): Promise<WebWorkerMLCEngine> {
-  const webWorkerMLCEngine = new WebWorkerMLCEngine(worker);
-  webWorkerMLCEngine.setInitProgressCallback(
-    engineConfig?.initProgressCallback,
-  );
-  await webWorkerMLCEngine.reload(
-    modelId,
-    engineConfig?.chatOpts,
-    engineConfig?.appConfig,
-  );
+  const webWorkerMLCEngine = new WebWorkerMLCEngine(worker, engineConfig);
+  await webWorkerMLCEngine.reload(modelId, chatOpts);
   return webWorkerMLCEngine;
 }
 
@@ -350,6 +334,14 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
   public worker: ChatWorker;
   public chat: API.Chat;
 
+  /**
+   * The modelId and chatOpts that the frontend expects the backend engine is currently loaded
+   * with. Needed for service worker. It is the backend and handler's job to match up with the
+   * expectation despite the service worker possibly being killed.
+   */
+  modelId?: string;
+  chatOpts?: ChatOptions;
+
   private initProgressCallback?: InitProgressCallback;
   private generateCallbackRegistry = new Map<
     string,
@@ -357,11 +349,27 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
   >();
   private pendingPromise = new Map<string, (msg: WorkerResponse) => void>();
 
-  constructor(worker: ChatWorker) {
+  constructor(worker: ChatWorker, engineConfig?: MLCEngineConfig) {
     this.worker = worker;
     worker.onmessage = (event: any) => {
       this.onmessage.bind(this)(event);
     };
+
+    if (engineConfig?.appConfig) {
+      this.setAppConfig(engineConfig?.appConfig);
+    }
+    if (engineConfig?.logLevel) {
+      this.setLogLevel(engineConfig?.logLevel);
+    }
+    this.setInitProgressCallback(engineConfig?.initProgressCallback);
+    if (engineConfig?.logitProcessorRegistry) {
+      if (engineConfig?.logitProcessorRegistry) {
+        log.warn(
+          "Warning: The `logitProcessorRegistry` property in `engineConfig` will be ignored when using the WebWorkerMLCEngine constructor. To set `logitProcessorRegistry`, use the engine constructor within the worker script instead.",
+        );
+      }
+    }
+
     this.chat = new API.Chat(this);
   }
 
@@ -371,6 +379,25 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
 
   getInitProgressCallback(): InitProgressCallback | undefined {
     return this.initProgressCallback;
+  }
+
+  setAppConfig(appConfig: AppConfig) {
+    const msg: WorkerRequest = {
+      kind: "setAppConfig",
+      uuid: crypto.randomUUID(),
+      content: appConfig,
+    };
+    this.worker.postMessage(msg);
+  }
+
+  setLogLevel(logLevel: LogLevel) {
+    log.setLevel(logLevel);
+    const msg: WorkerRequest = {
+      kind: "setLogLevel",
+      uuid: crypto.randomUUID(),
+      content: logLevel,
+    };
+    this.worker.postMessage(msg);
   }
 
   protected getPromise<T extends MessageContent>(
@@ -399,21 +426,18 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
     return promise;
   }
 
-  async reload(
-    modelId: string,
-    chatOpts?: ChatOptions,
-    appConfig?: AppConfig,
-  ): Promise<void> {
+  async reload(modelId: string, chatOpts?: ChatOptions): Promise<void> {
     const msg: WorkerRequest = {
       kind: "reload",
       uuid: crypto.randomUUID(),
       content: {
         modelId: modelId,
         chatOpts: chatOpts,
-        appConfig: appConfig,
       },
     };
     await this.getPromise<null>(msg);
+    this.modelId = modelId;
+    this.chatOpts = chatOpts;
   }
 
   async getMaxStorageBufferBindingSize(): Promise<number> {
@@ -489,6 +513,8 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       content: null,
     };
     await this.getPromise<null>(msg);
+    this.modelId = undefined;
+    this.chatOpts = undefined;
   }
 
   async resetChat(keepStats = false): Promise<void> {
@@ -556,6 +582,10 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
   async chatCompletion(
     request: ChatCompletionRequest,
   ): Promise<AsyncIterable<ChatCompletionChunk> | ChatCompletion> {
+    if (this.modelId === undefined) {
+      throw new WorkerEngineModelNotLoadedError(this.constructor.name);
+    }
+
     if (request.stream) {
       // First let worker instantiate a generator
       const msg: WorkerRequest = {
@@ -563,6 +593,8 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
         uuid: crypto.randomUUID(),
         content: {
           request: request,
+          modelId: this.modelId,
+          chatOpts: this.chatOpts,
         },
       };
       await this.getPromise<null>(msg);
@@ -577,17 +609,9 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       uuid: crypto.randomUUID(),
       content: {
         request: request,
+        modelId: this.modelId,
+        chatOpts: this.chatOpts,
       },
-    };
-    return await this.getPromise<ChatCompletion>(msg);
-  }
-
-  async setLogLevel(logLevel: LogLevel) {
-    log.setLevel(logLevel);
-    const msg: WorkerRequest = {
-      kind: "setLogLevel",
-      uuid: crypto.randomUUID(),
-      content: logLevel,
     };
     return await this.getPromise<ChatCompletion>(msg);
   }
@@ -634,12 +658,7 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       }
       default: {
         const unknownMsg = msg as any;
-        throw Error(
-          "Unknown message kind, msg=[" +
-            unknownMsg.kind +
-            "] " +
-            unknownMsg.content,
-        );
+        throw new UnknownMessageKindError(unknownMsg.kind, unknownMsg.content);
       }
     }
   }

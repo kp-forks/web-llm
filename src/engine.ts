@@ -41,13 +41,29 @@ import {
   getConversation,
 } from "./conversation";
 import { cleanModelUrl } from "./support";
-
-const ERROR_WEBGPU_NOT_AVAILABLE = new Error(
-  "WebGPU is not supported in your current environment, but it is necessary to run the WebLLM engine. " +
-    "Please make sure that your browser supports WebGPU and that it is enabled in your browser settings. " +
-    "You can also consult your browser's compatibility chart to see if it supports WebGPU. " +
-    "For more information about WebGPU support in your browser, visit https://webgpureport.org/",
-);
+import {
+  ChatModuleNotInitializedError,
+  ConfigurationNotInitializedError,
+  ContentTypeError,
+  DeviceLostError,
+  FeatureSupportError,
+  FunctionNotFoundError,
+  InvalidToolChoiceError,
+  MessageOrderError,
+  MissingModelWasmError,
+  ModelNotFoundError,
+  ModelNotLoadedError,
+  ShaderF16SupportError,
+  SystemMessageOrderError,
+  ToolCallOutputInvalidTypeError,
+  ToolCallOutputMissingFieldsError,
+  ToolCallOutputParseError,
+  UnsupportedRoleError,
+  UnsupportedTokenizerFilesError,
+  UnsupportedToolChoiceTypeError,
+  UnsupportedToolTypeError,
+  WebGPUNotAvailableError,
+} from "./error";
 
 /**
  * Creates `MLCEngine`, and loads `modelId` onto WebGPU.
@@ -57,6 +73,7 @@ const ERROR_WEBGPU_NOT_AVAILABLE = new Error(
  * @param modelId The model to load, needs to either be in `webllm.prebuiltAppConfig`, or in
  * `engineConfig.appConfig`.
  * @param engineConfig Optionally configures the engine, see `webllm.MLCEngineConfig`.
+ * @param chatOpts Extra options to override chat behavior specified in `mlc-chat-config.json`.
  * @returns An initialized `WebLLM.MLCEngine` with `modelId` loaded.
  * @throws Throws error when device lost (mostly due to OOM); users should re-call `CreateMLCEngine()`,
  *   potentially with a smaller model or smaller context window size.
@@ -64,12 +81,10 @@ const ERROR_WEBGPU_NOT_AVAILABLE = new Error(
 export async function CreateMLCEngine(
   modelId: string,
   engineConfig?: MLCEngineConfig,
+  chatOpts?: ChatOptions,
 ): Promise<MLCEngine> {
-  const engine = new MLCEngine();
-  engine.setLogLevel(engineConfig?.logLevel || DefaultLogLevel);
-  engine.setInitProgressCallback(engineConfig?.initProgressCallback);
-  engine.setLogitProcessorRegistry(engineConfig?.logitProcessorRegistry);
-  await engine.reload(modelId, engineConfig?.chatOpts, engineConfig?.appConfig);
+  const engine = new MLCEngine(engineConfig);
+  await engine.reload(modelId, chatOpts);
   return engine;
 }
 
@@ -90,9 +105,19 @@ export class MLCEngine implements MLCEngineInterface {
   private interruptSignal = false;
   private deviceLostIsError = true; // whether device.lost is due to actual error or model reload
   private config?: ChatConfig;
+  private appConfig: AppConfig;
 
-  constructor() {
+  constructor(engineConfig?: MLCEngineConfig) {
+    this.appConfig = engineConfig?.appConfig || prebuiltAppConfig;
+    this.setLogLevel(engineConfig?.logLevel || DefaultLogLevel);
+    this.setInitProgressCallback(engineConfig?.initProgressCallback);
+    this.setLogitProcessorRegistry(engineConfig?.logitProcessorRegistry);
+
     this.chat = new API.Chat(this);
+  }
+
+  setAppConfig(appConfig: AppConfig) {
+    this.appConfig = appConfig;
   }
 
   setInitProgressCallback(initProgressCallback?: InitProgressCallback) {
@@ -114,31 +139,21 @@ export class MLCEngine implements MLCEngineInterface {
    * @param modelId The model to load, needs to either be in `webllm.prebuiltAppConfig`, or in
    * `engineConfig.appConfig`.
    * @param chatOpts To optionally override the `mlc-chat-config.json` of `modelId`.
-   * @param appConfig Configure the app with the list of models and whether to use IndexedDB cache.
    * @throws Throws error when device lost (mostly due to OOM); users should re-call reload(),
    *   potentially with a smaller model or smaller context window size.
    */
-  async reload(
-    modelId: string,
-    chatOpts?: ChatOptions,
-    appConfig?: AppConfig,
-  ): Promise<void> {
+  async reload(modelId: string, chatOpts?: ChatOptions): Promise<void> {
     await this.unload();
 
     this.logitProcessor = this.logitProcessorRegistry?.get(modelId);
     const tstart = performance.now();
-    if (appConfig === undefined) {
-      appConfig = prebuiltAppConfig;
-    }
 
     const findModelRecord = () => {
-      const matchedItem = appConfig?.model_list.find(
+      const matchedItem = this.appConfig?.model_list.find(
         (item) => item.model_id == modelId,
       );
       if (matchedItem !== undefined) return matchedItem;
-      throw Error(
-        `Failed to load model: No URL found for model ID "${modelId}". Please check if the model ID is correct and included in the model_list configuration.`,
-      );
+      throw new ModelNotFoundError(modelId);
     };
 
     const modelRecord = findModelRecord();
@@ -152,7 +167,7 @@ export class MLCEngine implements MLCEngineInterface {
     }
 
     let configCache: tvmjs.ArtifactCacheTemplate;
-    if (appConfig.useIndexedDBCache) {
+    if (this.appConfig.useIndexedDBCache) {
       configCache = new tvmjs.ArtifactIndexedDBCache("webllm/config");
     } else {
       configCache = new tvmjs.ArtifactCache("webllm/config");
@@ -168,7 +183,7 @@ export class MLCEngine implements MLCEngineInterface {
 
     // load tvm wasm
     let wasmCache: tvmjs.ArtifactCacheTemplate;
-    if (appConfig.useIndexedDBCache) {
+    if (this.appConfig.useIndexedDBCache) {
       wasmCache = new tvmjs.ArtifactIndexedDBCache("webllm/wasm");
     } else {
       wasmCache = new tvmjs.ArtifactCache("webllm/wasm");
@@ -176,11 +191,7 @@ export class MLCEngine implements MLCEngineInterface {
 
     const wasmUrl = modelRecord.model_lib;
     if (wasmUrl === undefined) {
-      throw Error(
-        'Missing `model_lib` for the model with ID "' +
-          modelRecord.model_id +
-          '". Please ensure that `model_lib` is provided in `model_list` for each model. This URL is essential for downloading the WASM library necessary to run the model.',
-      );
+      throw new MissingModelWasmError(modelRecord.model_id);
     }
     const fetchWasmSource = async () => {
       if (wasmUrl.includes("localhost")) {
@@ -210,7 +221,7 @@ export class MLCEngine implements MLCEngineInterface {
     // detect GPU
     const gpuDetectOutput = await tvmjs.detectGPUDevice();
     if (gpuDetectOutput == undefined) {
-      throw ERROR_WEBGPU_NOT_AVAILABLE;
+      throw new WebGPUNotAvailableError();
     }
     let gpuLabel = "WebGPU";
     if (gpuDetectOutput.adapterInfo.description.length != 0) {
@@ -222,17 +233,9 @@ export class MLCEngine implements MLCEngineInterface {
       for (const feature of modelRecord.required_features) {
         if (!gpuDetectOutput.device.features.has(feature)) {
           if (feature == "shader-f16") {
-            throw Error(
-              "This model requires WebGPU extension shader-f16, " +
-                "which is not enabled in this browser. " +
-                'You can try to launch Chrome Canary in command line with flag "--enable-dawn-features=allow_unsafe_apis".',
-            );
+            throw new ShaderF16SupportError();
           }
-          throw Error(
-            "This model requires feature " +
-              feature +
-              ", which is not yet supported by this browser. ",
-          );
+          throw new FeatureSupportError(feature);
         }
       }
     }
@@ -257,9 +260,9 @@ export class MLCEngine implements MLCEngineInterface {
     const tokenizer = await this.asyncLoadTokenizer(
       modelUrl,
       this.config,
-      appConfig,
+      this.appConfig,
     );
-    const cacheType = appConfig.useIndexedDBCache ? "indexeddb" : "cache";
+    const cacheType = this.appConfig.useIndexedDBCache ? "indexeddb" : "cache";
     await tvm.fetchNDArrayCache(
       modelUrl,
       tvm.webgpu(),
@@ -286,9 +289,7 @@ export class MLCEngine implements MLCEngineInterface {
     this.currentModelId = modelId;
 
     if (deviceLostInReload) {
-      throw Error(
-        "The WebGPU device was lost while loading the model. This issue often occurs due to running out of memory (OOM). To resolve this, try reloading with a model that has fewer parameters or uses a smaller context length.",
-      );
+      throw new DeviceLostError();
     }
   }
 
@@ -517,9 +518,7 @@ export class MLCEngine implements MLCEngineInterface {
   ): Promise<AsyncIterable<ChatCompletionChunk> | ChatCompletion> {
     // 0. Preprocess inputs
     if (!this.currentModelId) {
-      throw new Error(
-        "Model not loaded before calling chatCompletion(). Please ensure you have called `MLCEngine.reload(model)` to load the model before initiating chat operations, or initialize your engine using `CreateMLCEngine()` with a valid model configuration.",
-      );
+      throw new ModelNotLoadedError();
     }
     ChatCompletionAPI.postInitAndCheckFields(request, this.currentModelId);
     const genConfig: GenerationConfig = {
@@ -635,6 +634,12 @@ export class MLCEngine implements MLCEngineInterface {
   }
 
   async runtimeStatsText(): Promise<string> {
+    log.warn(
+      "WARNING: `runtimeStatsText()` will soon be deprecated. " +
+        "Please use `ChatCompletion.usage` for non-streaming requests, or " +
+        "`ChatCompletionChunk.usage` for streaming requests, enabled by `stream_options`. " +
+        "The only flow that expects to use `runtimeStatsText()` as of now is `forwardTokensAndSample()`.",
+    );
     return this.getPipeline().runtimeStatsText();
   }
 
@@ -654,7 +659,7 @@ export class MLCEngine implements MLCEngineInterface {
     // First detect GPU
     const gpuDetectOutput = await tvmjs.detectGPUDevice();
     if (gpuDetectOutput == undefined) {
-      throw ERROR_WEBGPU_NOT_AVAILABLE;
+      throw new WebGPUNotAvailableError();
     }
 
     const computeMB = (value: number) => {
@@ -683,7 +688,7 @@ export class MLCEngine implements MLCEngineInterface {
     // First detect GPU
     const gpuDetectOutput = await tvmjs.detectGPUDevice();
     if (gpuDetectOutput == undefined) {
-      throw ERROR_WEBGPU_NOT_AVAILABLE;
+      throw new WebGPUNotAvailableError();
     }
     return gpuDetectOutput.adapterInfo.vendor;
   }
@@ -763,26 +768,26 @@ export class MLCEngine implements MLCEngineInterface {
       typeof input[lastId].content !== "string"
     ) {
       // TODO(Charlie): modify condition after we support multimodal inputs
-      throw Error("The last message should be a string from the `user`.");
+      throw new MessageOrderError(
+        "The last message should be a string from the `user`.",
+      );
     }
     for (let i = 0; i < input.length - 1; i++) {
       const message: ChatCompletionMessageParam = input[i];
       if (message.role === "system") {
         if (i !== 0) {
-          throw new Error(
-            "System prompt should always be the first message in `messages`.",
-          );
+          throw new SystemMessageOrderError();
         }
         conversation.override_system_message = message.content;
       } else if (message.role === "user") {
         if (typeof message.content !== "string") {
           // TODO(Charlie): modify condition after we support multimodal inputs
-          throw new Error("Last messages should be a string from the `user`.");
+          throw new ContentTypeError(message.role + "'s message");
         }
         conversation.appendMessage(Role.user, message.content, message.name);
       } else if (message.role === "assistant") {
         if (typeof message.content !== "string") {
-          throw new Error("Assistant message should have string content.");
+          throw new ContentTypeError(message.role + "'s message");
         }
         conversation.appendMessage(
           Role.assistant,
@@ -790,7 +795,7 @@ export class MLCEngine implements MLCEngineInterface {
           message.name,
         );
       } else {
-        throw new Error("Unsupported role of message: " + message.role);
+        throw new UnsupportedRoleError(message.role);
       }
     }
     return conversation;
@@ -814,17 +819,13 @@ export class MLCEngine implements MLCEngineInterface {
       typeof request.tool_choice == "string" &&
       request.tool_choice !== "auto"
     ) {
-      throw Error(
-        `Invalid tool choice value: '${request.tool_choice}'. Please check your input and try again.`,
-      );
+      throw new InvalidToolChoiceError(request.tool_choice);
     }
     if (
       typeof request.tool_choice !== "string" &&
       request.tool_choice?.type !== "function"
     ) {
-      throw Error(
-        "Unsupported tool choice type. Only tool choices of type 'function' are supported.",
-      );
+      throw new UnsupportedToolChoiceTypeError();
     }
 
     const singleFunctionToCall =
@@ -836,15 +837,13 @@ export class MLCEngine implements MLCEngineInterface {
           return JSON.stringify([f.function]);
         }
       }
-      throw Error(
-        `The tool choice function ${singleFunctionToCall} is not found in the tools list`,
-      );
+      throw new FunctionNotFoundError(singleFunctionToCall);
     }
 
     const function_list = [];
     for (const f of request.tools) {
       if (f.type !== "function") {
-        throw Error("Only 'function' tool type is supported");
+        throw new UnsupportedToolTypeError();
       }
       function_list.push(f.function);
     }
@@ -876,20 +875,12 @@ export class MLCEngine implements MLCEngineInterface {
     try {
       toolCallsObject = JSON.parse(outputMessage);
     } catch (err) {
-      throw new Error(
-        "Internal error: error encountered when parsing outputMessage for function " +
-          "calling. Got outputMessage: " +
-          outputMessage +
-          "\nGot error: " +
-          err,
-      );
+      throw new ToolCallOutputParseError(outputMessage, err as Error);
     }
 
     // 2. Expect to be an array
     if (!(toolCallsObject instanceof Array)) {
-      throw new Error(
-        "Internal error: expect output of function calling to be an array",
-      );
+      throw new ToolCallOutputInvalidTypeError("array");
     }
 
     // 3. Parse each tool call and populate tool_calls
@@ -901,10 +892,9 @@ export class MLCEngine implements MLCEngineInterface {
         curToolCall.name === undefined ||
         curToolCall.arguments === undefined
       ) {
-        throw new Error(
-          "Expect generated tool call to have fields `name` and `arguments`, " +
-            "but got object: " +
-            curToolCall,
+        throw new ToolCallOutputMissingFieldsError(
+          ["name", "arguments"],
+          curToolCall,
         );
       }
       tool_calls.push({
@@ -964,9 +954,7 @@ export class MLCEngine implements MLCEngineInterface {
     genConfig?: GenerationConfig,
   ) {
     if (this.config === undefined) {
-      throw Error(
-        "Configuration not initialized. Ensure you have called `reload()` function first.",
-      );
+      throw new ConfigurationNotInitializedError();
     }
     let input_str: string;
     let input_role_str: string | undefined;
@@ -1010,9 +998,7 @@ export class MLCEngine implements MLCEngineInterface {
 
   private getPipeline(): LLMChatPipeline {
     if (this.pipeline === undefined) {
-      throw Error(
-        "Chat module not yet initialized. Ensure you initialize the chat module by calling `chat.reload()` first.",
-      );
+      throw new ChatModuleNotInitializedError();
     }
     return this.pipeline;
   }
@@ -1045,6 +1031,6 @@ export class MLCEngine implements MLCEngineInterface {
       const model = await modelCache.fetchWithCache(url, "arraybuffer");
       return Tokenizer.fromSentencePiece(model);
     }
-    throw Error("Cannot handle tokenizer files " + config.tokenizer_files);
+    throw new UnsupportedTokenizerFilesError(config.tokenizer_files);
   }
 }

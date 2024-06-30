@@ -7,6 +7,7 @@ export {
   prebuiltAppConfig,
   modelVersion,
   modelLibURLPrefix,
+  functionCallingModelIds,
 } from "./config";
 
 export {
@@ -28,7 +29,7 @@ export {
 } from "./cache_util";
 
 export {
-  MLCEngineWorkerHandler,
+  WebWorkerMLCEngineHandler,
   WebWorkerMLCEngine,
   CreateWebWorkerMLCEngine,
 } from "./web_worker";

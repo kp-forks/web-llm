@@ -240,7 +240,7 @@ class ChatUI {
     this.engine.setInitProgressCallback(initProgressCallback);
 
     try {
-      await this.engine.reload(this.selectedModel, undefined, this.config);
+      await this.engine.reload(this.selectedModel);
     } catch (err) {
       this.appendMessage("error", "Init error, " + err.toString());
       console.log(err.stack);
@@ -278,19 +278,30 @@ class ChatUI {
 
     try {
       let curMessage = "";
+      let usage: webllm.CompletionUsage | undefined = undefined;
       const completion = await this.engine.chat.completions.create({
         stream: true,
         messages: this.chatHistory,
+        stream_options: { include_usage: true },
       });
       // TODO(Charlie): Processing of � requires changes
       for await (const chunk of completion) {
-        const curDelta = chunk.choices[0].delta.content;
+        const curDelta = chunk.choices[0]?.delta.content;
         if (curDelta) {
           curMessage += curDelta;
         }
         this.updateLastMessage("left", curMessage);
+        if (chunk.usage) {
+          usage = chunk.usage;
+        }
       }
-      this.uiChatInfoLabel.innerHTML = await this.engine.runtimeStatsText();
+      if (usage) {
+        this.uiChatInfoLabel.innerHTML =
+          `prompt_tokens: ${usage.prompt_tokens}, ` +
+          `completion_tokens: ${usage.completion_tokens}, ` +
+          `prefill: ${usage.extra.prefill_tokens_per_s.toFixed(4)} tokens/sec, ` +
+          `decoding: ${usage.extra.decode_tokens_per_s.toFixed(4)} tokens/sec`;
+      }
       const finalMessage = await this.engine.getMessage();
       this.updateLastMessage("left", finalMessage); // TODO: Remove this after � issue is fixed
       this.chatHistory.push({ role: "assistant", content: finalMessage });
@@ -311,9 +322,10 @@ let engine: webllm.MLCEngineInterface;
 if (useWebWorker) {
   engine = new webllm.WebWorkerMLCEngine(
     new Worker(new URL("./worker.ts", import.meta.url), { type: "module" }),
+    { appConfig },
   );
 } else {
-  engine = new webllm.MLCEngine();
+  engine = new webllm.MLCEngine({ appConfig });
 }
 ChatUI.CreateAsync(engine);
 

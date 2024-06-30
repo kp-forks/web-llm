@@ -1,14 +1,26 @@
 import * as tvmjs from "tvmjs";
 import log from "loglevel";
-import { AppConfig, ChatOptions, MLCEngineConfig } from "./config";
-import { ReloadParams, WorkerRequest, WorkerResponse } from "./message";
-import { MLCEngineInterface, InitProgressReport } from "./types";
+import { ChatOptions, MLCEngineConfig } from "./config";
 import {
-  MLCEngineWorkerHandler,
+  ReloadParams,
+  WorkerRequest,
+  WorkerResponse,
+  ChatCompletionNonStreamingParams,
+  ChatCompletionStreamInitParams,
+} from "./message";
+import { InitProgressReport } from "./types";
+import {
+  WebWorkerMLCEngineHandler,
   WebWorkerMLCEngine,
   ChatWorker,
 } from "./web_worker";
-import { areAppConfigsEqual, areChatOptionsEqual } from "./utils";
+import { areChatOptionsEqual } from "./utils";
+import { ChatCompletionChunk } from "./openai_api_protocols/index";
+import {
+  NoServiceWorkerAPIError,
+  NonWorkerEnvironmentError,
+  ServiceWorkerInitializationError,
+} from "./error";
 
 /* Service Worker Script */
 
@@ -30,47 +42,40 @@ type IServiceWorker = globalThis.ServiceWorker;
  *   port.onMessage.addListener(handler.onmessage.bind(handler));
  * });
  */
-export class ServiceWorkerMLCEngineHandler extends MLCEngineWorkerHandler {
+export class ServiceWorkerMLCEngineHandler extends WebWorkerMLCEngineHandler {
+  /**
+   * The modelId and chatOpts that the underlying engine (backend) is currently loaded with.
+   *
+   * TODO(webllm-team): This is always in-sync with `this.engine` unless device is lost due to
+   * unexpected reason. Therefore, we should get it from `this.engine` directly and make handler
+   * stateless. We should also perhaps make `engine` of type `MLCEngine` instead. Besides, consider
+   * if we should add appConfig, or use engine's API to find the corresponding model record rather
+   * than relying on just the modelId.
+   */
   modelId?: string;
   chatOpts?: ChatOptions;
-  appConfig?: AppConfig;
 
   private clientRegistry = new Map<
     string,
     IServiceWorker | Client | MessagePort
   >();
-  private initReuqestUuid?: string;
+  private initRequestUuid?: string;
 
-  constructor(engine: MLCEngineInterface) {
+  constructor() {
     if (!self || !("addEventListener" in self)) {
-      throw new Error(
-        "ServiceWorkerGlobalScope is not defined. ServiceWorkerMLCEngineHandler must be created in service worker script.",
-      );
+      throw new NonWorkerEnvironmentError("ServiceWorkerMLCEngineHandler");
     }
-    const postMessageHandler = {
-      postMessage: (message: WorkerResponse) => {
-        if (this.clientRegistry.has(message.uuid)) {
-          const client = this.clientRegistry.get(message.uuid);
-          client?.postMessage(message);
+    super();
+    const onmessage = this.onmessage.bind(this);
 
-          if (message.kind === "return" || message.kind === "throw") {
-            this.clientRegistry.delete(message.uuid);
-          } else {
-            // TODO: Delete clientRegistry after complete to avoid memory leak?
-          }
-        }
-      },
-    };
-    const initProgressCallback = (report: InitProgressReport) => {
+    this.engine.setInitProgressCallback((report: InitProgressReport) => {
       const msg: WorkerResponse = {
         kind: "initProgressCallback",
-        uuid: this.initReuqestUuid || "",
+        uuid: this.initRequestUuid || "",
         content: report,
       };
-      this.postMessageInternal(msg);
-    };
-    super(engine, postMessageHandler, initProgressCallback);
-    const onmessage = this.onmessage.bind(this);
+      this.postMessage(msg);
+    });
 
     self.addEventListener("message", (event) => {
       const message = event as unknown as ExtendableMessageEvent;
@@ -85,6 +90,19 @@ export class ServiceWorkerMLCEngineHandler extends MLCEngineWorkerHandler {
     });
   }
 
+  postMessage(message: WorkerResponse) {
+    if (this.clientRegistry.has(message.uuid)) {
+      const client = this.clientRegistry.get(message.uuid);
+      client?.postMessage(message);
+
+      if (message.kind === "return" || message.kind === "throw") {
+        this.clientRegistry.delete(message.uuid);
+      } else {
+        // TODO(nestor): Delete clientRegistry after complete to avoid memory leak?
+      }
+    }
+  }
+
   onmessage(
     event: ExtendableMessageEvent,
     onComplete?: (value: any) => void,
@@ -95,25 +113,24 @@ export class ServiceWorkerMLCEngineHandler extends MLCEngineWorkerHandler {
       `ServiceWorker message: [${msg.kind}] ${JSON.stringify(msg.content)}`,
     );
 
+    // Special case message handling different from WebWorkerMLCEngineHandler
     if (msg.kind === "keepAlive") {
-      const reply: WorkerRequest = {
+      const reply: WorkerResponse = {
         kind: "heartbeat",
         uuid: msg.uuid,
-        content: "",
       };
-      this.postMessageInternal(reply);
+      this.postMessage(reply);
       onComplete?.(reply);
       return;
     }
 
-    if (msg.kind === "init") {
+    if (msg.kind === "reload") {
       this.handleTask(msg.uuid, async () => {
         const params = msg.content as ReloadParams;
         // If the modelId, chatOpts, and appConfig are the same, immediately return
         if (
           this.modelId === params.modelId &&
-          areChatOptionsEqual(this.chatOpts, params.chatOpts) &&
-          areAppConfigsEqual(this.appConfig, params.appConfig)
+          areChatOptionsEqual(this.chatOpts, params.chatOpts)
         ) {
           log.info("Already loaded the model. Skip loading");
           const gpuDetectOutput = await tvmjs.detectGPUDevice();
@@ -135,28 +152,82 @@ export class ServiceWorkerMLCEngineHandler extends MLCEngineWorkerHandler {
           return null;
         }
 
-        this.initReuqestUuid = msg.uuid;
-        await this.engine.reload(
-          params.modelId,
-          params.chatOpts,
-          params.appConfig,
-        );
+        this.initRequestUuid = msg.uuid;
+        await this.engine.reload(params.modelId, params.chatOpts);
         this.modelId = params.modelId;
         this.chatOpts = params.chatOpts;
-        this.appConfig = params.appConfig;
         onComplete?.(null);
         return null;
       });
       return;
     }
+
+    if (msg.kind === "unload") {
+      this.handleTask(msg.uuid, async () => {
+        await this.engine.unload();
+        onComplete?.(null);
+        this.modelId = undefined;
+        this.chatOpts = undefined;
+        return null;
+      });
+      return;
+    }
+
+    if (msg.kind === "chatCompletionNonStreaming") {
+      // Directly return the ChatCompletion response
+      this.handleTask(msg.uuid, async () => {
+        const params = msg.content as ChatCompletionNonStreamingParams;
+        // Check whether frontend expectation matches with backend (modelId and chatOpts)
+        // If not (due to possibly killed service worker), we reload here.
+        if (this.modelId !== params.modelId) {
+          log.warn(
+            "ServiceWorkerMLCEngine expects model is loaded in ServiceWorkerMLCEngineHandler, " +
+              "but it is not. This may due to service worker is unexpectedly killed. ",
+          );
+          log.info("Reloading engine in ServiceWorkerMLCEngineHandler.");
+          this.initRequestUuid = msg.uuid;
+          await this.engine.reload(params.modelId, params.chatOpts);
+        }
+        const res = await this.engine.chatCompletion(params.request);
+        onComplete?.(res);
+        return res;
+      });
+      return;
+    }
+
+    if (msg.kind === "chatCompletionStreamInit") {
+      // One-time set up that instantiates the chunk generator in worker
+      this.handleTask(msg.uuid, async () => {
+        const params = msg.content as ChatCompletionStreamInitParams;
+        // Check whether frontend expectation matches with backend (modelId and chatOpts)
+        // If not (due to possibly killed service worker), we reload here.
+        if (this.modelId !== params.modelId) {
+          log.warn(
+            "ServiceWorkerMLCEngine expects model is loaded in ServiceWorkerMLCEngineHandler, " +
+              "but it is not. This may due to service worker is unexpectedly killed. ",
+          );
+          log.info("Reloading engine in ServiceWorkerMLCEngineHandler.");
+          this.initRequestUuid = msg.uuid;
+          await this.engine.reload(params.modelId, params.chatOpts);
+        }
+        this.chatCompletionAsyncChunkGenerator =
+          (await this.engine.chatCompletion(params.request)) as AsyncGenerator<
+            ChatCompletionChunk,
+            void,
+            void
+          >;
+        onComplete?.(null);
+        return null;
+      });
+      return;
+    }
+
+    // All rest of message handling are the same as WebWorkerMLCEngineHandler
     super.onmessage(msg, onComplete, onError);
   }
 }
 
 /* Webapp Client */
-/**
- * PostMessageHandler wrapper for sending message from client to service worker
- */
 export class ServiceWorker implements ChatWorker {
   _onmessage: (event: MessageEvent) => void = () => {};
 
@@ -168,14 +239,14 @@ export class ServiceWorker implements ChatWorker {
     this._onmessage = handler;
 
     if (!("serviceWorker" in navigator)) {
-      throw new Error("Service worker API is not available");
+      throw new NoServiceWorkerAPIError();
     }
     (navigator.serviceWorker as ServiceWorkerContainer).onmessage = handler;
   }
 
   postMessage(message: WorkerRequest) {
     if (!("serviceWorker" in navigator)) {
-      throw new Error("Service worker API is not available");
+      throw new NoServiceWorkerAPIError();
     }
     const serviceWorker = (navigator.serviceWorker as ServiceWorkerContainer)
       .controller;
@@ -197,34 +268,23 @@ export class ServiceWorker implements ChatWorker {
 export async function CreateServiceWorkerMLCEngine(
   modelId: string,
   engineConfig?: MLCEngineConfig,
+  chatOpts?: ChatOptions,
+  keepAliveMs = 10000,
 ): Promise<ServiceWorkerMLCEngine> {
   if (!("serviceWorker" in navigator)) {
-    throw new Error(
-      "Service worker API is not available in your browser. Please ensure that your browser supports service workers and that you are using a secure context (HTTPS). " +
-        "Check the browser compatibility and ensure that service workers are not disabled in your browser settings.",
-    );
+    throw new NoServiceWorkerAPIError();
   }
   const serviceWorkerAPI = navigator.serviceWorker as ServiceWorkerContainer;
   const registration = await serviceWorkerAPI.ready;
   const serviceWorker = registration.active || serviceWorkerAPI.controller;
   if (!serviceWorker) {
-    throw new Error(
-      "Service worker failed to initialize. This could be due to a failure in the service worker registration process or because the service worker is not active. " +
-        "Please refresh the page to retry initializing the service worker.",
-    );
+    throw new ServiceWorkerInitializationError();
   }
-  const serviceWorkerMLCEngine = new ServiceWorkerMLCEngine();
-  if (engineConfig?.logLevel) {
-    serviceWorkerMLCEngine.setLogLevel(engineConfig.logLevel);
-  }
-  serviceWorkerMLCEngine.setInitProgressCallback(
-    engineConfig?.initProgressCallback,
+  const serviceWorkerMLCEngine = new ServiceWorkerMLCEngine(
+    engineConfig,
+    keepAliveMs,
   );
-  await serviceWorkerMLCEngine.init(
-    modelId,
-    engineConfig?.chatOpts,
-    engineConfig?.appConfig,
-  );
+  await serviceWorkerMLCEngine.reload(modelId, chatOpts);
   return serviceWorkerMLCEngine;
 }
 
@@ -234,12 +294,13 @@ export async function CreateServiceWorkerMLCEngine(
 export class ServiceWorkerMLCEngine extends WebWorkerMLCEngine {
   missedHeatbeat = 0;
 
-  constructor(keepAliveMs = 10000) {
+  constructor(engineConfig?: MLCEngineConfig, keepAliveMs = 10000) {
     if (!("serviceWorker" in navigator)) {
-      throw new Error("Service worker API is not available");
+      throw new NoServiceWorkerAPIError();
     }
-    super(new ServiceWorker());
+    super(new ServiceWorker(), engineConfig);
 
+    // Keep alive through periodical heartbeat signals
     setInterval(() => {
       this.worker.postMessage({ kind: "keepAlive", uuid: crypto.randomUUID() });
       this.missedHeatbeat += 1;
@@ -264,33 +325,5 @@ export class ServiceWorkerMLCEngine extends WebWorkerMLCEngine {
         log.error("CreateWebServiceWorkerMLCEngine.onmessage", err);
       }
     }
-  }
-
-  /**
-   * Initialize the chat with a model.
-   *
-   * @param modelId model_id of the model to load.
-   * @param chatOpts Extra options to overide chat behavior.
-   * @param appConfig Override the app config in this load.
-   * @returns A promise when reload finishes.
-   * @note The difference between init and reload is that init
-   * should be called only once when the engine is created, while reload
-   * can be called multiple times to switch between models.
-   */
-  async init(
-    modelId: string,
-    chatOpts?: ChatOptions,
-    appConfig?: AppConfig,
-  ): Promise<void> {
-    const msg: WorkerRequest = {
-      kind: "init",
-      uuid: crypto.randomUUID(),
-      content: {
-        modelId: modelId,
-        chatOpts: chatOpts,
-        appConfig: appConfig,
-      },
-    };
-    await this.getPromise<null>(msg);
   }
 }
